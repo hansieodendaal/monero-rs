@@ -35,14 +35,15 @@ macro_rules! impl_consensus_encoding {
         impl $crate::consensus::encode::Decodable for $thing {
             #[inline]
             fn consensus_decode<R: ::std::io::Read + ?Sized>(
-                r: &mut R
-            ) -> Result<$thing, $crate::consensus::encode::Error> {
+                r: &mut R,
+            ) -> Result<$thing, $crate::consensus::encode::EncodeError> {
                 Ok($thing {
                     $( $field: crate::consensus::encode::Decodable::consensus_decode(r)?, )+
                 })
             }
         }
     );
+
 }
 
 macro_rules! impl_hex_display {
