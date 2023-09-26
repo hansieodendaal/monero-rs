@@ -40,6 +40,9 @@ use crate::util::{address, key, ringct};
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
 
+/// The maximum memory size of a vector that can be allocated during decoding.
+pub const MAX_VEC_MEM_ALLOC_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+
 /// Errors encountered when encoding or decoding data.
 #[derive(Error, Debug)]
 pub enum Error {
@@ -60,7 +63,7 @@ pub enum Error {
     Address(#[from] address::Error),
     /// A generic parsing error.
     #[error("Parsing error: {0}")]
-    ParseFailed(&'static str),
+    ParseFailed(String),
 }
 
 /// Encode an object into a vector of byte.
@@ -85,9 +88,11 @@ pub fn deserialize<T: Decodable>(data: &[u8]) -> Result<T, Error> {
     if consumed == data.len() {
         Ok(rv)
     } else {
-        Err(Error::ParseFailed(
-            "data not consumed entirely when explicitly deserializing",
-        ))
+        Err(Error::ParseFailed(format!(
+            "data not consumed entirely when explicitly deserializing: input data {}, consumed {}",
+            data.len(),
+            consumed
+        )))
     }
 }
 
@@ -357,7 +362,7 @@ impl Decodable for VarInt {
             // Zero in any position other than the first is invalid
             // since it is not the shortest encoding.
             if n == 0 && !res.is_empty() {
-                return Err(Error::ParseFailed("VarInt has a zero in a position other than the first. This is not the shortest encoding."));
+                return Err(Error::ParseFailed("VarInt has a zero in a position other than the first. This is not the shortest encoding.".to_string()));
             }
             res.push(n & 0b0111_1111);
             if n & 0b1000_0000 == 0 {
@@ -371,9 +376,8 @@ impl Decodable for VarInt {
             int |= *bits as u64;
             int = if int.leading_zeros() >= 7 {
                 int << 7
-            }
-            else {
-                 return Err(Error::ParseFailed("VarInt overflows u64"));
+            } else {
+                return Err(Error::ParseFailed("VarInt overflows u64".to_string()));
             };
         }
         int |= *last as u64;
@@ -414,7 +418,7 @@ impl Decodable for String {
     #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<String, Error> {
         String::from_utf8(Decodable::consensus_decode(r)?)
-            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8".to_string()))
     }
 }
 
@@ -482,16 +486,20 @@ impl<T: Encodable> Encodable for Vec<T> {
 impl<T: Decodable> Decodable for Vec<T> {
     #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
-        const MAX_VEC_ALLOC_SIZE: usize = 4 * 1024 * 1024;
         let len = usize::try_from(*VarInt::consensus_decode(r)?)
-            .map_err(|_| self::Error::ParseFailed("VarInt overflows usize"))?;
+            .map_err(|_| Error::ParseFailed("VarInt overflows usize".to_string()))?;
 
-        // Prevent allocations larger than 4 MiB
+        // Prevent allocations larger than the maximum allowed size
         let layout_size = mem::size_of::<T>().saturating_mul(len);
-        if layout_size > MAX_VEC_ALLOC_SIZE {
-            return Err(self::Error::ParseFailed(
-                "length exceeds maximum allocatable bytes (4 MiB)",
-            ));
+        if layout_size > MAX_VEC_MEM_ALLOC_SIZE {
+            return Err(Error::ParseFailed(format!(
+                "length ({} x {} = {}) exceeds maximum allocatable bytes ({}) by {} bytes",
+                mem::size_of::<T>(),
+                len,
+                layout_size,
+                MAX_VEC_MEM_ALLOC_SIZE,
+                layout_size.saturating_sub(MAX_VEC_MEM_ALLOC_SIZE),
+            )));
         }
 
         let mut ret = Vec::with_capacity(len);
@@ -502,14 +510,28 @@ impl<T: Decodable> Decodable for Vec<T> {
     }
 }
 
-macro_rules! decode_sized_vec {
-    ( $size:expr, $d:expr ) => {{
-        let mut ret = Vec::with_capacity($size as usize);
-        for _ in 0..$size {
-            ret.push(Decodable::consensus_decode($d)?);
-        }
-        ret
-    }};
+/// Decode a vector of a given size
+pub fn consensus_decode_sized_vec<R: io::Read + ?Sized, T: Decodable>(
+    r: &mut R,
+    size: usize,
+) -> Result<Vec<T>, Error> {
+    let layout_size = mem::size_of::<T>().saturating_mul(size);
+    if layout_size > MAX_VEC_MEM_ALLOC_SIZE {
+        return Err(Error::ParseFailed(format!(
+            "length ({} x {} = {}) exceeds maximum allocatable bytes ({}) by {} bytes",
+            mem::size_of::<T>(),
+            size,
+            layout_size,
+            MAX_VEC_MEM_ALLOC_SIZE,
+            layout_size.saturating_sub(MAX_VEC_MEM_ALLOC_SIZE),
+        )));
+    }
+    let mut ret = Vec::with_capacity(size);
+    for _ in 0..size {
+        let item = Decodable::consensus_decode(r)?;
+        ret.push(item);
+    }
+    Ok(ret)
 }
 
 macro_rules! encode_sized_vec {
@@ -533,8 +555,22 @@ impl<T: Encodable> Encodable for Box<[T]> {
 impl<T: Decodable> Decodable for Box<[T]> {
     #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
-        let len = VarInt::consensus_decode(r)?.0;
-        let len = len as usize;
+        let len = usize::try_from(*VarInt::consensus_decode(r)?)
+            .map_err(|e| Error::ParseFailed(format!("VarInt overflows usize ({})", e)))?;
+
+        // Prevent allocations larger than the maximum allowed size
+        let layout_size = mem::size_of::<T>().saturating_mul(len);
+        if layout_size > MAX_VEC_MEM_ALLOC_SIZE {
+            return Err(Error::ParseFailed(format!(
+                "length ({} x {} = {}) exceeds maximum allocatable bytes ({}) by {} bytes",
+                mem::size_of::<T>(),
+                len,
+                layout_size,
+                MAX_VEC_MEM_ALLOC_SIZE,
+                layout_size.saturating_sub(MAX_VEC_MEM_ALLOC_SIZE),
+            )));
+        }
+
         let mut ret = Vec::with_capacity(len);
         for _ in 0..len {
             ret.push(Decodable::consensus_decode(r)?);
@@ -546,6 +582,7 @@ impl<T: Decodable> Decodable for Box<[T]> {
 #[cfg(test)]
 mod tests {
     use super::{deserialize, serialize, Error, VarInt};
+    use crate::consensus::encode::MAX_VEC_MEM_ALLOC_SIZE;
     use crate::{Block, TxIn};
 
     #[test]
@@ -563,21 +600,22 @@ mod tests {
         assert_eq!(max, int);
 
         // varint must be shortest encoding
-        let res = deserialize::<VarInt>(&[152,0]);
+        let res = deserialize::<VarInt>(&[152, 0]);
         assert!(matches!(res.unwrap_err(), Error::ParseFailed(_)));
 
         // If the last number is not a 0, it will error with an IO error (UnexpectedEof)
         let res = deserialize::<VarInt>(&[255u8; 1]);
         assert!(matches!(res.unwrap_err(), Error::Io(_)));
 
-
         // Add one to the max u64 data.
-        assert_eq!(max_u64_data[len_max-1], 0x01);
-        max_u64_data[len_max-1] += 1;
+        assert_eq!(max_u64_data[len_max - 1], 0x01);
+        max_u64_data[len_max - 1] += 1;
         let res = deserialize::<VarInt>(&max_u64_data);
         assert!(matches!(res.unwrap_err(), Error::ParseFailed(_)));
 
-        let res = deserialize::<VarInt>(&[255u8, 255u8,255u8,255u8,255u8,255u8,255u8,255u8,255u8,255u8, 1u8 ]);
+        let res = deserialize::<VarInt>(&[
+            255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 1u8,
+        ]);
         assert!(matches!(res.unwrap_err(), Error::ParseFailed(_)));
     }
 
@@ -595,7 +633,15 @@ mod tests {
         let data = deserialize::<Vec<u8>>(&vec).unwrap();
         assert_eq!(data, vec[1..]);
 
+        let vec = vec![
+            [0u8; 64], [1u8; 64], [2u8; 64], [3u8; 64], [4u8; 64], [5u8; 64], [6u8; 64], [7u8; 64],
+        ];
+        let vec_buffer = serialize(&vec);
+        let data = deserialize::<Vec<[u8; 64]>>(&vec_buffer).unwrap();
+        assert_eq!(data, vec);
+
         let tx_in = serialize(&TxIn::Gen { height: VarInt(1) });
+        // First byte is len = 8
         let mut vec = vec![0x08u8];
         for _ in 0..8 {
             vec.extend(tx_in.clone());
@@ -604,11 +650,71 @@ mod tests {
         assert!(tx_ins.iter().all(|t| *t == TxIn::Gen { height: VarInt(1) }));
     }
     #[test]
-    fn deserialize_vec_max_allocation() {
-        let len = VarInt(((4 * 1024 * 1024) / 64) + 1);
+    fn deserialize_voc_with_inadequate_buffer() {
+        let err = deserialize::<Vec<[u8; 64]>>(&[]).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        let len = VarInt(1);
         let data = serialize(&len);
         let err = deserialize::<Vec<[u8; 64]>>(&data).unwrap_err();
-        assert!(matches!(err, Error::ParseFailed(_)));
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn deserialize_varint_with_empty_buffer() {
+        let err = deserialize::<VarInt>(&[]).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn deserialize_vec_max_allocation() {
+        for length in (0..10).chain(
+            (MAX_VEC_MEM_ALLOC_SIZE / 64) as u64 - 10..=(MAX_VEC_MEM_ALLOC_SIZE / 64) as u64 + 10,
+        ) {
+            let len = VarInt(length);
+            let data = serialize(&len);
+            let res = deserialize::<Vec<[u8; 64]>>(&data);
+            if length == 0 {
+                assert!(res.is_ok());
+            } else {
+                let err = res.unwrap_err();
+                if length <= (MAX_VEC_MEM_ALLOC_SIZE / 64) as u64 {
+                    assert!(matches!(err, Error::Io(_)));
+                } else {
+                    assert!(matches!(err, Error::ParseFailed(_)));
+                }
+            }
+        }
+
+        let data_len = 100u64;
+        let mut data = serialize(&VarInt(data_len));
+        for i in 0..data_len {
+            data.push((i % 255) as u8);
+        }
+        assert_eq!(data[1..], deserialize::<Vec<u8>>(&data[..]).unwrap());
+
+        for length in (0..10)
+            .chain(data_len - 10..=data_len + 10)
+            .chain(MAX_VEC_MEM_ALLOC_SIZE as u64 - 10..=MAX_VEC_MEM_ALLOC_SIZE as u64 + 10)
+        {
+            let replace_len = VarInt(length);
+            let replace_len_bytes = serialize(&replace_len);
+            for (i, val) in replace_len_bytes.iter().enumerate() {
+                data[i] = *val;
+            }
+            let res = deserialize::<Vec<u8>>(&data[..]);
+            if length == data_len {
+                assert!(res.is_ok());
+            } else {
+                let err = res.unwrap_err();
+                if length < data_len {
+                    assert!(matches!(err, Error::ParseFailed(_)));
+                } else if length <= MAX_VEC_MEM_ALLOC_SIZE as u64 {
+                    assert!(matches!(err, Error::Io(_)));
+                } else {
+                    assert!(matches!(err, Error::ParseFailed(_)));
+                }
+            }
+        }
     }
 
     #[test]

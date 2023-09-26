@@ -884,7 +884,9 @@ impl Decodable for SubField {
             0xde => Ok(SubField::MysteriousMinerGate(Decodable::consensus_decode(
                 r,
             )?)),
-            _ => Err(encode::Error::ParseFailed("Invalid sub-field type")),
+            _ => Err(encode::Error::ParseFailed(
+                "Invalid sub-field type".to_string(),
+            )),
         }
     }
 }
@@ -946,7 +948,7 @@ impl Decodable for TxIn {
                 key_offsets: Decodable::consensus_decode(r)?,
                 k_image: Decodable::consensus_decode(r)?,
             }),
-            _ => Err(encode::Error::ParseFailed("Invalid input type")),
+            _ => Err(encode::Error::ParseFailed("Invalid input type".to_string())),
         }
     }
 }
@@ -984,7 +986,9 @@ impl Decodable for TxOutTarget {
                 key: Decodable::consensus_decode(r)?,
                 view_tag: Decodable::consensus_decode(r)?,
             }),
-            _ => Err(encode::Error::ParseFailed("Invalid output type")),
+            _ => Err(encode::Error::ParseFailed(
+                "Invalid output type".to_string(),
+            )),
         }
     }
 }
@@ -1056,7 +1060,16 @@ impl Decodable for Transaction {
                         if sig.rct_type != RctType::Null {
                             let mixin_size = if inputs > 0 {
                                 match &prefix.inputs[0] {
-                                    TxIn::ToKey { key_offsets, .. } => key_offsets.len() - 1,
+                                    TxIn::ToKey { key_offsets, .. } => {
+                                        match key_offsets.len().checked_sub(1) {
+                                            Some(val) => val,
+                                            None => {
+                                                return Err(encode::Error::ParseFailed(
+                                                    "Invalid input type".to_string(),
+                                                ))
+                                            }
+                                        }
+                                    }
                                     _ => 0,
                                 }
                             } else {
@@ -1118,6 +1131,10 @@ mod tests {
     use crate::cryptonote::hash::Hashable;
     use crate::util::key::{PrivateKey, PublicKey, ViewPair};
     use crate::util::ringct::{RctSig, RctSigBase, RctType};
+    use crate::util::test_utils::{
+        fuzz_create_extra_field, fuzz_create_transaction_1, fuzz_extra_field_try_parse,
+        fuzz_transaction_deserialize, fuzz_transaction_hash, AddPadding,
+    };
     use crate::{
         blockdata::transaction::{SubField, TxIn, TxOutTarget},
         cryptonote::onetime_key::SubKeyChecker,
@@ -1474,5 +1491,147 @@ mod tests {
         assert!(raw_extra_field.is_ok());
         let extra_field = raw_extra_field.unwrap().try_parse();
         assert_eq!(parsed_extra_field, extra_field.0);
+    }
+
+    #[test]
+    fn previous_fuzz_transaction_deserialize_failures() {
+        let data = [];
+        fuzz_transaction_deserialize(&data);
+
+        // panic: memory overflow
+        let data = [
+            80, 80, 1, 255, 255, 15, 0, 0, 3, 61, 3, 181, 181, 181, 181, 181, 181, 181, 181, 80,
+            254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        fuzz_transaction_deserialize(&data);
+
+        // panic: memory overflow
+        let data = [
+            80, 80, 1, 255, 255, 255, 15, 0, 0, 3, 61, 3, 181, 181, 181, 181, 181, 255, 2, 0, 0,
+            39, 74, 2, 0, 33, 247, 255, 255, 255, 255, 0, 13, 0, 0, 6, 1, 0, 39, 74, 2, 255, 255,
+            255, 255, 255, 255, 15, 255, 255, 255,
+        ];
+        fuzz_transaction_deserialize(&data);
+
+        // panic: memory overflow
+        let data = [
+            80, 80, 1, 255, 255, 255, 15, 0, 0, 3, 61, 3, 181, 181, 181, 181, 181, 181, 255, 2, 13,
+            1, 0, 2, 255, 255, 141, 255, 6, 0, 0, 1, 255, 25, 25, 25, 25, 25, 25, 25, 25, 25, 93,
+            25, 25, 25, 25, 26, 25, 25, 25, 25, 25, 4, 4, 4, 4, 4, 4, 4, 4, 4, 255, 59, 176, 46, 1,
+            0, 0, 0, 4, 4, 4, 4, 4, 4, 176, 25, 25, 191, 25, 25, 25, 176, 0, 0, 6, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 59, 0, 0, 0, 0, 0, 0, 181, 255, 2, 0, 181, 181, 2, 0, 0, 0, 39, 74, 2,
+            255, 39, 0, 0, 0, 0,
+        ];
+        fuzz_transaction_deserialize(&data);
+
+        // panic in debug mode: attempt to subtract with overflow
+        let data = [
+            243, 234, 250, 206, 219, 191, 157, 204, 227, 1, 243, 234, 250, 206, 219, 191, 157, 204,
+            227, 1, 3, 2, 243, 234, 250, 206, 219, 191, 157, 204, 227, 1, 0, 86, 208, 218, 110, 84,
+            55, 145, 152, 189, 5, 59, 111, 187, 198, 60, 15, 56, 116, 12, 172, 171, 109, 39, 244,
+            69, 249, 171, 225, 161, 5, 54, 195, 255, 243, 234, 250, 206, 219, 191, 157, 204, 227,
+            1, 2, 243, 234, 250, 206, 219, 191, 157, 204, 227, 1, 1, 243, 234, 250, 206, 219, 191,
+            157, 204, 227, 1, 86, 208, 218, 110, 84, 55, 145, 152, 189, 5, 59, 111, 187, 198, 60,
+            15, 56, 116, 12, 172, 171, 109, 39, 244, 69, 249, 171, 225, 161, 5, 54, 195, 2, 243,
+            234, 250, 206, 219, 191, 157, 204, 227, 1, 2, 129, 189, 21, 98, 112, 84, 208, 34, 188,
+            15, 57, 32, 105, 202, 180, 228, 65, 26, 206, 144, 111, 248, 116, 110, 216, 117, 239,
+            254, 115, 211, 228, 200, 243, 234, 250, 206, 219, 191, 157, 204, 227, 1, 3, 243, 253,
+            28, 32, 197, 249, 139, 123, 62, 246, 178, 71, 130, 68, 165, 12, 147, 254, 104, 236, 30,
+            165, 85, 164, 185, 82, 11, 181, 254, 84, 203, 116, 86, 145, 2, 1, 139, 101, 89, 112,
+            21, 55, 153, 175, 42, 234, 220, 159, 241, 173, 208, 234, 108, 114, 81, 213, 65, 84,
+            207, 169, 44, 23, 58, 13, 211, 156, 31, 148, 2, 21, 115, 181, 222, 185, 253, 117, 152,
+            227, 140, 41, 55, 255, 222, 204, 24, 201, 247, 63, 194, 153, 139, 3, 33, 243, 234, 250,
+            206, 219, 191, 157, 204, 227, 1, 86, 208, 218, 110, 84, 55, 145, 152, 189, 5, 59, 111,
+            187, 198, 60, 15, 56, 116, 12, 172, 171, 109, 39, 244, 69, 249, 171, 225, 161, 5, 54,
+            195, 4, 1, 139, 101, 89, 112, 21, 55, 153, 175, 42, 234, 220, 159, 241, 173, 208, 234,
+            108, 114, 81, 213, 65, 84, 207, 169, 44, 23, 58, 13, 211, 156, 31, 148, 222, 21, 115,
+            181, 222, 185, 253, 117, 152, 227, 140, 41, 55, 255, 222, 204, 24, 201, 247, 63, 194,
+            153, 139, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 243, 234, 250, 206, 219, 191, 157, 204, 227, 1, 68, 165, 73, 137, 250, 90,
+            98, 216, 175, 33, 242, 246, 188, 114, 110, 245, 140, 41, 39, 69, 85, 234, 179, 130,
+            138, 67, 252, 61, 23, 214, 117, 248, 139, 93, 34, 113, 228, 119, 78, 222, 76, 34, 241,
+            224, 138, 111, 79, 193, 50, 21, 163, 107, 70, 56, 251, 86, 86, 239, 45, 13, 0, 182,
+            174, 215, 68, 165, 73, 137, 250, 90, 98, 216, 175, 33, 242, 246, 188, 114, 110, 245,
+            140, 41, 39, 69, 85, 234, 179, 130, 138, 67, 252, 61, 23, 214, 117, 248, 139, 93, 34,
+            113, 228, 119, 78, 222, 76, 34, 241, 224, 138, 111, 79, 193, 50, 21, 163, 107, 70, 56,
+            251, 86, 86, 239, 45, 13, 0, 182, 174, 215, 145, 214, 35, 128, 40, 137, 113, 28, 64,
+            57, 174, 145, 223, 85, 67, 20, 178, 228, 12, 70, 145, 99, 207, 66, 28, 227, 199, 149,
+            174, 176, 194, 192, 132, 23, 1, 101, 90, 169, 134, 67, 12, 238, 78, 148, 220, 73, 77,
+            16, 135, 195, 71, 141, 162, 33, 80, 45, 75, 33, 238, 193, 113, 223, 132, 207,
+        ];
+        fuzz_transaction_deserialize(&data);
+    }
+
+    #[test]
+    fn previous_fuzz_extra_field_try_parse_failures() {
+        fn fuzz(data: &[u8]) -> bool {
+            let add_padding = if data.is_empty() {
+                AddPadding::ToFront
+            } else {
+                match data.len() % 3 {
+                    0 => AddPadding::ToFront,
+                    1 => AddPadding::ToMiddle,
+                    2 => AddPadding::ToRear,
+                    _ => unreachable!(),
+                }
+            };
+            let extra_field = fuzz_create_extra_field(data, add_padding);
+            fuzz_extra_field_try_parse(&extra_field, add_padding, data)
+        }
+
+        // debug:   In `pub fn serialize<T: Encodable + std::fmt::Debug + ?Sized>(data: &T) -> Vec<u8>`
+        //          panic at `debug_assert_eq!(len, encoder.len());`
+        // release: ExtraField (a) -> RawExtraField -> ExtraField (b), then a != b
+
+        let data = [];
+        fuzz(&data);
+
+        let data = [
+            91, 86, 142, 50, 243, 100, 212, 198, 107, 255, 206, 80, 145, 191, 90, 100, 130, 104,
+            209, 200, 198, 59, 255, 208, 102, 37, 220, 130, 196, 117, 146, 206, 1, 170, 29, 188,
+            232, 44, 80, 73,
+        ];
+        fuzz(&data);
+
+        let data = [
+            145, 3, 214, 14, 6, 254, 80, 126, 90, 197, 1, 205, 194, 86, 212, 36, 180, 95, 232, 70,
+            12, 74,
+        ];
+        fuzz(&data);
+
+        let data = [
+            1, 80, 136, 235, 162, 250, 119, 87, 48, 63, 212, 65, 14, 61, 103, 177, 47, 128, 88,
+            127, 88, 255, 113, 151, 16, 234, 236, 159, 55, 174, 7, 231, 145, 93, 224, 205, 196, 40,
+            90, 58, 197, 42, 173, 206, 101, 197, 161, 27, 88, 40, 108, 255, 244, 95, 116, 228, 30,
+            200, 67, 114, 66, 116, 1, 246, 16, 223, 50, 68, 39, 144, 231, 234, 199, 244, 255, 176,
+            101, 201, 125, 85, 245, 170,
+        ];
+        fuzz(&data);
+    }
+
+    #[test]
+    fn previous_fuzz_transaction_hash_failures() {
+        fn fuzz(data: &[u8]) -> bool {
+            let transaction = fuzz_create_transaction_1(data);
+            fuzz_transaction_hash(&transaction)
+        }
+
+        // panic 'called `Result::unwrap()` on an `Err` value: Custom { kind: Interrupted, error: ScriptNotSupported }'
+        //   in `pub fn serialize<T: Encodable + std::fmt::Debug + ?Sized>(data: &T) -> Vec<u8>`
+        //   at `let len = data.consensus_encode(&mut encoder).unwrap();`
+
+        let data = [];
+        fuzz(&data);
+        let data = [234, 236, 159, 55, 174, 7, 231];
+        fuzz(&data);
+        let data = [
+            173, 206, 101, 197, 161, 39, 144, 231, 234, 199, 244, 255, 176, 101, 201, 125, 85, 245,
+            170, 27, 88, 40, 108, 255, 244, 95, 116, 228, 30, 200, 67, 114, 66, 116, 1, 246, 16,
+            223, 50, 68,
+        ];
+        fuzz(&data);
     }
 }
